@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timer</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)">
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#888; --line:#ddd; --alert:#c00; color-scheme: light dark; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --muted:#777; --line:#333; --alert:#f55; } }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 16px system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1.5rem; padding: 1rem; }
+  nav { display: flex; gap: .25rem; }
+  nav button[aria-pressed="true"] { border-color: var(--fg); color: var(--fg); }
+  #display { font: 300 clamp(3rem, 17vw, 14rem)/1 ui-monospace, "SF Mono", Consolas, monospace;
+             font-variant-numeric: tabular-nums; letter-spacing: -.02em; outline: none; white-space: nowrap; }
+  #display.done { color: var(--alert); }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; justify-content: center; }
+  button, input { font: inherit; color: var(--muted); background: none; border: 1px solid var(--line);
+                  border-radius: 6px; padding: .45rem .9rem; cursor: pointer; }
+  button:hover { color: var(--fg); }
+  input { width: 4.2rem; text-align: center; color: var(--fg); cursor: text; }
+  label { color: var(--muted); font-size: .85rem; display: flex; flex-direction: column; align-items: center; gap: .25rem; }
+  /* hide native spinners; the light chevrons replace them */
+  input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+  .arrow { border: 0; padding: .2rem 1.2rem; opacity: .45; line-height: 0; }
+  .arrow:hover, .arrow:focus-visible { opacity: 1; }
+  .arrow::before { content: ""; display: inline-block; width: .55rem; height: .55rem;
+                   border: solid currentColor; border-width: 1.5px 1.5px 0 0; transform: translateY(25%) rotate(-45deg); }
+  .arrow.down::before { transform: translateY(-25%) rotate(135deg); }
+  #laps { list-style: none; margin: 0; padding: 0; color: var(--muted); font-family: ui-monospace, Consolas, monospace;
+          font-variant-numeric: tabular-nums; max-height: 30vh; overflow: auto; text-align: right; }
+  .hint { position: fixed; bottom: .5rem; color: var(--muted); font-size: .75rem; opacity: .6; }
+</style>
+</head>
+<body>
+  <nav>
+    <button id="modeTimer" aria-pressed="true">Timer</button>
+    <button id="modeWatch" aria-pressed="false">Stopwatch</button>
+  </nav>
+
+  <div id="display" aria-live="off">05:00</div>
+
+  <div class="row" id="setRow">
+    <label>h<button class="arrow" data-for="h" data-step="1" aria-label="Hours up"></button><input id="h" type="number" min="0" max="99" value="0" inputmode="numeric"><button class="arrow down" data-for="h" data-step="-1" aria-label="Hours down"></button></label>
+    <label>m<button class="arrow" data-for="m" data-step="1" aria-label="Minutes up"></button><input id="m" type="number" min="0" max="59" value="5" inputmode="numeric"><button class="arrow down" data-for="m" data-step="-1" aria-label="Minutes down"></button></label>
+    <label>s<button class="arrow" data-for="s" data-step="1" aria-label="Seconds up"></button><input id="s" type="number" min="0" max="59" value="0" inputmode="numeric"><button class="arrow down" data-for="s" data-step="-1" aria-label="Seconds down"></button></label>
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start</button>
+    <button id="lapBtn" hidden>Lap</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <ol id="laps" hidden></ol>
+  <div class="hint">Space start/pause · R reset · L lap · F fullscreen</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const display = $('display'), startBtn = $('startBtn'), resetBtn = $('resetBtn'), lapBtn = $('lapBtn');
+  const setRow = $('setRow'), laps = $('laps');
+  const inputs = [$('h'), $('m'), $('s')];
+
+  let mode = 'timer';       // 'timer' | 'watch'
+  let running = false;
+  let startedAt = 0;        // performance.now() when last started
+  let banked = 0;           // ms accumulated before last start
+  let target = 300000;      // timer duration in ms
+  let rafId = 0, beepTimer = 0, audio;
+
+  const now = () => performance.now();
+  const elapsed = () => banked + (running ? now() - startedAt : 0);
+
+  function fmt(ms, showTenths) {
+    const t = Math.max(0, ms);
+    const total = Math.floor(t / 1000);
+    const h = Math.floor(total / 3600), m = Math.floor(total / 60) % 60, s = total % 60;
+    const p = n => String(n).padStart(2, '0');
+    let out = (h ? h + ':' + p(m) : p(m)) + ':' + p(s);
+    if (showTenths) out += '.' + Math.floor(t % 1000 / 100);
+    return out;
+  }
+
+  function readInputs() {
+    const [h, m, s] = inputs.map(i => Math.max(0, parseInt(i.value, 10) || 0));
+    target = ((h * 60 + m) * 60 + s) * 1000;
+  }
+
+  function render() {
+    if (mode === 'timer') {
+      const left = target - elapsed();
+      // ceil so "00:01" shows until the final second actually ends
+      display.textContent = fmt(Math.ceil(left / 1000) * 1000, false);
+      document.title = running ? fmt(Math.ceil(left / 1000) * 1000) : 'Timer';
+      if (running && left <= 0) finish();
+    } else {
+      display.textContent = fmt(elapsed(), true);
+      document.title = running ? fmt(elapsed()) : 'Stopwatch';
+    }
+  }
+
+  function loop() { render(); if (running) rafId = requestAnimationFrame(loop); }
+  // rAF pauses in hidden tabs; a coarse interval keeps the title and alarm working there.
+  setInterval(() => { if (running) render(); }, 250);
+
+  function start() {
+    if (mode === 'timer') {
+      if (!running && banked === 0) readInputs();
+      if (target <= 0) return;
+      if (banked === 0) saveLast();
+      unlockAudio();
+    }
+    running = true; startedAt = now();
+    startBtn.textContent = 'Pause';
+    setRow.hidden = true;
+    display.classList.remove('done');
+    loop();
+  }
+
+  function pause() {
+    banked = elapsed(); running = false;
+    cancelAnimationFrame(rafId);
+    startBtn.textContent = 'Resume';
+    render();
+  }
+
+  function reset() {
+    running = false; banked = 0;
+    cancelAnimationFrame(rafId); stopBeep();
+    startBtn.textContent = 'Start';
+    display.classList.remove('done');
+    laps.innerHTML = ''; laps.hidden = true;
+    setRow.hidden = mode !== 'timer';
+    if (mode === 'timer') readInputs();
+    render();
+  }
+
+  function finish() {
+    running = false; banked = 0; setRow.hidden = false;
+    cancelAnimationFrame(rafId);
+    display.textContent = '00:00';
+    display.classList.add('done');
+    document.title = "Time's up";
+    startBtn.textContent = 'Start';
+    beep();
+  }
+
+  function lap() {
+    if (mode !== 'watch' || !running) return;
+    const li = document.createElement('li');
+    li.textContent = (laps.children.length + 1) + '   ' + fmt(elapsed(), true);
+    laps.prepend(li); laps.hidden = false;
+  }
+
+  // --- sound (Web Audio, no files) ---
+  function unlockAudio() {
+    try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
+  }
+  function tone() {
+    if (!audio) return;
+    const o = audio.createOscillator(), g = audio.createGain(), t = audio.currentTime;
+    o.frequency.value = 880; o.connect(g); g.connect(audio.destination);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.3, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
+    o.start(t); o.stop(t + 0.45);
+  }
+  function beep() { stopBeep(); let n = 0; tone(); beepTimer = setInterval(() => (++n < 10 ? tone() : stopBeep()), 1000); }
+  function stopBeep() { clearInterval(beepTimer); beepTimer = 0; }
+
+  // --- mode switching ---
+  function setMode(m) {
+    mode = m;
+    $('modeTimer').setAttribute('aria-pressed', m === 'timer');
+    $('modeWatch').setAttribute('aria-pressed', m === 'watch');
+    lapBtn.hidden = m !== 'watch';
+    reset();
+  }
+
+  $('modeTimer').onclick = () => setMode('timer');
+  $('modeWatch').onclick = () => setMode('watch');
+  startBtn.onclick = () => { stopBeep(); running ? pause() : start(); };
+  resetBtn.onclick = reset;
+  lapBtn.onclick = lap;
+  inputs.forEach(i => i.addEventListener('input', () => { if (!running && banked === 0) { readInputs(); render(); } }));
+  // Arrows wrap within range (59 -> 0, 0 -> 59); hold to repeat.
+  function nudge(btn) {
+    const i = $(btn.dataset.for), max = +i.max + 1;
+    i.value = (((parseInt(i.value, 10) || 0) + +btn.dataset.step) % max + max) % max;
+    i.dispatchEvent(new Event('input'));
+  }
+  document.querySelectorAll('.arrow').forEach(btn => {
+    let hold, rep;
+    const stop = () => { clearTimeout(hold); clearInterval(rep); };
+    btn.addEventListener('pointerdown', e => {
+      e.preventDefault(); nudge(btn);
+      hold = setTimeout(() => { rep = setInterval(() => nudge(btn), 80); }, 400);
+    });
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => btn.addEventListener(ev, stop));
+    btn.addEventListener('click', e => { if (e.detail === 0) nudge(btn); }); // keyboard Enter/Space
+  });
+  inputs.forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') { i.blur(); start(); } }));
+
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (k === ' ') { e.preventDefault(); startBtn.click(); }
+    else if (k === 'r') reset();
+    else if (k === 'l') lap();
+    else if (k === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
+  });
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Remember the last duration that was started (this browser only). Default is 5:00.
+  const KEY = 'timer.last';
+  function saveLast() {
+    try { localStorage.setItem(KEY, JSON.stringify(inputs.map(i => parseInt(i.value, 10) || 0))); } catch {}
+  }
+  function loadLast() {
+    try {
+      const v = JSON.parse(localStorage.getItem(KEY));
+      if (Array.isArray(v) && v.length === 3) inputs.forEach((i, n) => i.value = v[n]);
+    } catch {}
+  }
+
+  loadLast();
+  setMode('timer');
+})();
+</script>
+</body>
+</html>
